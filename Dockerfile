@@ -5,8 +5,6 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     gcc \
     locales \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
     && echo "ru_RU.UTF-8 UTF-8" > /etc/locale.gen \
     && locale-gen \
     && update-locale LANG=ru_RU.UTF-8
