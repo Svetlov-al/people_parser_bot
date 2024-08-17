@@ -1,23 +1,23 @@
-import asyncio
-import json
-import logging
 import os
+import json
 import time
+import io
+import asyncio
+import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from pyrogram import Client
-from pyrogram.errors import ChatAdminRequired, FloodWait
 from pyrogram.types import Message
+from pyrogram.errors import MsgIdInvalid, FloodWait, ChannelInvalid, ChatAdminRequired, UsernameNotOccupied
 
 from dotenv import load_dotenv
-
 
 load_dotenv()
 
@@ -44,6 +44,12 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
+parsed_users_count = 0
+parsing_in_progress = False
+
+parsed_users_count_lock = asyncio.Lock()
+new_users_count_lock = asyncio.Lock()
+
 channels = {}
 chats = {}
 users = set()
@@ -51,7 +57,6 @@ new_users = set()
 info_users = {}
 acs_users = set()
 auto_parser_settings = {}
-
 
 class Form(StatesGroup):
     addch = State()
@@ -63,7 +68,6 @@ class Form(StatesGroup):
     full_pars_ch = State()
     auto_parser = State()
     auto_parser_time = State()
-
 
 def load_users():
     users = set()
@@ -84,7 +88,6 @@ def load_users():
         logging.info("User database file not found. Starting with empty set.")
     return users
 
-
 def save_users(users):
     with open(full_base_file, 'w') as f:
         for user_id in users:
@@ -96,24 +99,20 @@ def save_users(users):
             }
             f.write(json.dumps({k: v for k, v in user_data.items() if v is not None and v != 'Not available'}) + '\n')
 
-
 def update_user_info(user_id, username, phone):
     if user_id not in info_users:
         info_users[user_id] = {}
-
+    
     if username and username != 'Not available':
         info_users[user_id]['username'] = username
     if phone and phone != 'Not available':
         info_users[user_id]['phone'] = phone
 
-
 def save_new_users(new_users):
     with open(new_users_file, 'w') as f:
         for user_id in new_users:
             user_info = info_users.get(user_id, {})
-            f.write(json.dumps({"user_id": user_id, "username": user_info.get('username', None),
-                                "phone": user_info.get('phone', None)}) + '\n')
-
+            f.write(json.dumps({"user_id": user_id, "username": user_info.get('username', None), "phone": user_info.get('phone', None)}) + '\n')
 
 def load_acs_users():
     try:
@@ -122,11 +121,9 @@ def load_acs_users():
     except FileNotFoundError:
         return set()
 
-
 def save_acs_users(acs_users):
     with open(acs_users_file, 'w') as f:
         json.dump(list(acs_users), f)
-
 
 def load_channels():
     try:
@@ -135,11 +132,9 @@ def load_channels():
     except FileNotFoundError:
         return {}
 
-
 def save_channels(channels):
     with open(channels_file, 'w') as f:
         json.dump(channels, f)
-
 
 def load_chats():
     try:
@@ -148,11 +143,9 @@ def load_chats():
     except FileNotFoundError:
         return {}
 
-
 def save_chats(chats):
     with open(chats_file, 'w') as f:
         json.dump(chats, f)
-
 
 def load_auto_parser_settings():
     try:
@@ -161,23 +154,24 @@ def load_auto_parser_settings():
     except FileNotFoundError:
         return {}
 
-
 def save_auto_parser_settings(settings):
     with open(auto_parser_settings_file, 'w') as f:
         json.dump(settings, f)
 
-
 @app.on_message()
 def handle_message(client, message: Message):
+    global new_users_count
     if message.from_user:
         user_id = message.from_user.id
         if user_id not in users:
             users.add(user_id)
             new_users.add(user_id)
+            new_users_count += 1  #  счетчик новых пользователей
             update_user_info(user_id, message.from_user.username, message.from_user.phone_number)
-
+            logging.info(f"Новый юзер аддед: {user_id}")
 
 async def parse_channels(limit=50):
+    global parsed_users_count, new_users_count
     async with app:
         for channel_username in channels.keys():
             if not parsing_in_progress:
@@ -186,12 +180,11 @@ async def parse_channels(limit=50):
 
             try:
                 channel = await app.get_chat(channel_username)
-
+                
                 async for message in app.get_chat_history(channel.id, limit=limit):
                     if not parsing_in_progress:
                         break
                     try:
-                        # Проверка на существование сообщения
                         if not await app.get_messages(channel.id, message.id):
                             logging.warning(f"Сообщение {message.id} не существует. Пропуск.")
                             continue
@@ -206,10 +199,16 @@ async def parse_channels(limit=50):
                                 }
                                 if user_data not in users_data:
                                     users_data.append(user_data)
-                                    logging.info(f"Добавлен пользователь: {user_data['username']}")
-
+                                    async with parsed_users_count_lock:
+                                        parsed_users_count += 1
+                                    if user_data['id'] not in users:
+                                        async with new_users_count_lock:
+                                            new_users.add(user_data['id'])
+                                            new_users_count += 1
+                                        logging.info(f"Добавлен пользователь: {user_data['id']}")
+                        
                         logging.info(f"Обработано сообщение {message.id}")
-
+                    
                     except Exception as e:
                         if "FLOOD_WAIT" in str(e):
                             wait_time = int(str(e).split()[-2])
@@ -221,7 +220,6 @@ async def parse_channels(limit=50):
                             logging.warning(f"Ошибка при обработке сообщения {message.id}: {str(e)}")
                         continue
 
-                    # Добавляем небольшую задержку между запросами
                     await asyncio.sleep(2)
 
                 if users_data:
@@ -230,7 +228,7 @@ async def parse_channels(limit=50):
                         users.add(user_id)
                         if user_id not in info_users:
                             new_users.add(user_id)
-                        update_user_info(user_id, user_data['username'], user_data['phone'])
+                        update_user_info(user_id, user_data['username'], user_data['phone'])    
                     logging.info(f"Данные {len(users_data)} пользователей сохранены в базу")
                 else:
                     logging.info(f"В канале {channel_username} не найдено комментариев с данными пользователей.")
@@ -238,8 +236,8 @@ async def parse_channels(limit=50):
             except Exception as e:
                 logging.error(f"Произошла ошибка: {str(e)}")
 
-
 async def parse_chat_members(chat_id):
+    global parsed_users_count
     async with app:
         try:
             async for member in app.get_chat_members(chat_id):
@@ -248,12 +246,13 @@ async def parse_chat_members(chat_id):
                 if user_id not in info_users:
                     new_users.add(user_id)
                 update_user_info(user_id, member.user.username, member.user.phone_number)
+                async with parsed_users_count_lock:
+                    parsed_users_count += 1
         except ChatAdminRequired:
             logging.warning(f"Необходимы права администратора для чата ID {chat_id}. Пропуск.")
         except FloodWait as e:
             logging.warning(f"Достигнут лимит запросов. Ожидание {e.value} секунд.")
             await asyncio.sleep(e.value)
-
 
 @dp.message_handler(commands=['start'])
 async def send_welcome(message: types.Message):
@@ -263,7 +262,6 @@ async def send_welcome(message: types.Message):
         await bot.delete_message(message.chat.id, no_access_message.message_id)
     else:
         await show_main_menu(message.from_user.id)
-
 
 async def update_main_menu_text(user_id):
     user_count = len(users)
@@ -276,7 +274,6 @@ async def update_main_menu_text(user_id):
         )
         await asyncio.sleep(5)
 
-
 @dp.callback_query_handler(lambda c: c.data == 'stop_parsing')
 async def stop_parsing(callback_query: types.CallbackQuery):
     global parsing_in_progress
@@ -286,7 +283,6 @@ async def stop_parsing(callback_query: types.CallbackQuery):
         await bot.send_message(callback_query.from_user.id, "Парсинг остановлен по запросу пользователя.")
     else:
         await bot.send_message(callback_query.from_user.id, "Парсинг не выполняется.")
-
 
 async def check_and_save_new_users_file():
     previous_size = None
@@ -302,27 +298,23 @@ async def check_and_save_new_users_file():
             # Если размер файла изменился
             if current_size != previous_size:
                 # Получаем текущую дату и время
-                current_time = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+                current_time = datetime.now().strftime("%d_%m_%Y_%H_%M")
 
                 # Создаем папку newFILES, если она не существует
                 if not os.path.exists('newFILES'):
                     os.makedirs('newFILES')
 
-                # Создаем имя для нового файла с датой и временем
-                new_file_name = f"new_users_{current_time}.json"
+                new_file_name = f"{current_time}.json"                          # JSON
                 new_file_path = os.path.join('newFILES', new_file_name)
 
-                # Копируем содержимое файла new_users.json в новый файл
                 with open('new_users.json', 'r') as original_file:
                     with open(new_file_path, 'w') as new_file:
                         new_file.write(original_file.read())
 
                 print(f"Создана копия файла new_users.json: {new_file_path}")
 
-                # Проверяем, существует ли файл converted_new_users.txt
                 if os.path.exists('converted_new_users.txt'):
-                    # Создаем имя для нового файла converted_new_users.txt с датой и временем
-                    converted_file_name = f"converted_new_users_{current_time}.txt"
+                    converted_file_name = f"{current_time}.txt"                # TXT
                     converted_file_path = os.path.join('newFILES', converted_file_name)
 
                     # Копируем содержимое файла converted_new_users.txt в новый файл
@@ -335,14 +327,12 @@ async def check_and_save_new_users_file():
                 # Обновляем предыдущий размер файла
                 previous_size = current_size
         else:
-            print("Файл new_users.json не найден.")
-
+            print("Новых людей в базе нет.")
 
 @dp.callback_query_handler(lambda c: c.data == 'convert')
 async def process_convert(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     await convert_and_send_files(callback_query.from_user.id)
-
 
 async def convert_and_send_files(user_id):
     # Конвертация full_base.json
@@ -351,16 +341,8 @@ async def convert_and_send_files(user_id):
         with open(full_base_file, 'r') as f:
             for line in f:
                 user_data = json.loads(line)
-                username = user_data.get('username', '')
-                phone = user_data.get('phone', '')
-                if username and username != 'None':
-                    username = f"@{username}"
-                else:
-                    username = ''
-                if phone and phone != 'None':
-                    phone = phone
-                else:
-                    phone = ''
+                username = f"@{user_data.get('username', '')}" if user_data.get('username') else ''
+                phone = user_data.get('phone', '') if user_data.get('phone') else ''
                 if username or phone:
                     converted_data.append(f"{username} {phone}")
     except FileNotFoundError:
@@ -378,6 +360,7 @@ async def convert_and_send_files(user_id):
 
     # Конвертация new_users.json
     converted_data = []
+    user_ids = []
     try:
         if os.path.getsize(new_users_file) == 0:
             logging.info("Файл new_users.json пуст.")
@@ -387,25 +370,20 @@ async def convert_and_send_files(user_id):
         with open(new_users_file, 'r') as f:
             for line in f:
                 user_data = json.loads(line)
-                username = user_data.get('username', '')
-                phone = user_data.get('phone', '')
+                username = f"@{user_data.get('username', '')}" if user_data.get('username') else ''
+                phone = user_data.get('phone', '') if user_data.get('phone') else ''
                 user_id_value = user_data.get('user_id', '')
-                if username and username != 'None':
-                    username = f"@{username}"
-                else:
-                    username = ''
-                if phone and phone != 'None':
-                    phone = phone
-                else:
-                    phone = ''
                 if username or phone:
                     converted_data.append(f"{username} {phone}")
-                else:
-                    converted_data.append(f"{username} {phone} {user_id_value}")
+                if user_id_value:
+                    user_ids.append(str(user_id_value))
     except FileNotFoundError:
         logging.error("Файл new_users.json не найден.")
         await bot.send_message(user_id, "Файл new_users.json не найден.")
         return
+
+    # Добавление ID в конец файла
+    converted_data.extend(user_ids)
 
     # Сохранение конвертированных данных в файл
     with open('converted_new_users.txt', 'w') as f:
@@ -420,6 +398,7 @@ async def convert_and_send_files(user_id):
         logging.error(f"Ошибка при отправке файла: {e}")
         await bot.send_message(user_id, f"Ошибка при отправке файла: {e}")
 
+main_menu_message_id = None
 
 async def show_main_menu(user_id: int):
     global main_menu_message_id
@@ -429,20 +408,15 @@ async def show_main_menu(user_id: int):
     keyboard.add(InlineKeyboardButton("Начать парсинг", callback_data='pars'))
     keyboard.add(InlineKeyboardButton("Полный парсинг канала", callback_data='full_pars_ch'))
     keyboard.add(InlineKeyboardButton("Автономный парсер", callback_data='auto_parser'))
-    #keyboard.add(InlineKeyboardButton("Конвертировать", callback_data='convert'))
     keyboard.add(InlineKeyboardButton("Настройки", callback_data='settings'))
     keyboard.add(InlineKeyboardButton("Файлы", callback_data='files'))
-    main_menu_message = await bot.send_photo(user_id, photo=open('images/main.jpg', 'rb'),
-                                             caption=f"Главное меню:\n\nВ базе: {user_count} чел\nСпарсено за последний раз: {last_parsed_count} чел",
-                                             reply_markup=keyboard)
+    main_menu_message = await bot.send_photo(user_id, photo=open('images/main.jpg', 'rb'), caption=f"Главное меню:\n\nВ базе: {user_count} чел\nСпарсено за последний раз: {last_parsed_count} чел", reply_markup=keyboard)
     main_menu_message_id = main_menu_message.message_id
-
 
 def get_cancel_keyboard():
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("Отмена", callback_data='cancel'))
     return keyboard
-
 
 @dp.callback_query_handler(lambda c: c.data == 'settings')
 async def process_settings(callback_query: types.CallbackQuery):
@@ -452,9 +426,7 @@ async def process_settings(callback_query: types.CallbackQuery):
     keyboard.add(InlineKeyboardButton("Каналы", callback_data='channels'))
     keyboard.add(InlineKeyboardButton("Чаты", callback_data='chats'))
     keyboard.add(InlineKeyboardButton("Закрыть", callback_data='close'))
-    await bot.send_photo(callback_query.from_user.id, photo=open('images/settings.jpg', 'rb'), caption="Настройки:",
-                         reply_markup=keyboard)
-
+    await bot.send_photo(callback_query.from_user.id, photo=open('images/settings.jpg', 'rb'), caption="Настройки:", reply_markup=keyboard)
 
 @dp.callback_query_handler(lambda c: c.data == 'admin')
 async def process_admin(callback_query: types.CallbackQuery):
@@ -464,25 +436,19 @@ async def process_admin(callback_query: types.CallbackQuery):
     keyboard.add(InlineKeyboardButton("Добавить", callback_data='add_acs'))
     keyboard.add(InlineKeyboardButton("Удалить", callback_data='del_acs'))
     keyboard.add(InlineKeyboardButton("Закрыть", callback_data='close'))
-    await bot.send_photo(callback_query.from_user.id, photo=open('images/admin.jpg', 'rb'),
-                         caption=f"Администраторы:\n{admins}", reply_markup=keyboard)
-
+    await bot.send_photo(callback_query.from_user.id, photo=open('images/admin.jpg', 'rb'), caption=f"Администраторы:\n{admins}", reply_markup=keyboard)
 
 @dp.callback_query_handler(lambda c: c.data == 'add_acs')
 async def process_add_acs(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(callback_query.from_user.id, "Отправьте user_id для добавления:\n/cancel - отмена",
-                           reply_markup=get_cancel_keyboard())
+    await bot.send_message(callback_query.from_user.id, "Отправьте user_id для добавления:\n/cancel - отмена", reply_markup=get_cancel_keyboard())
     await Form.acs.set()
-
 
 @dp.callback_query_handler(lambda c: c.data == 'del_acs')
 async def process_del_acs(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(callback_query.from_user.id, "Отправьте user_id для удаления:\n/cancel - отмена",
-                           reply_markup=get_cancel_keyboard())
+    await bot.send_message(callback_query.from_user.id, "Отправьте user_id для удаления:\n/cancel - отмена", reply_markup=get_cancel_keyboard())
     await Form.acs.set()
-
 
 @dp.message_handler(state=Form.acs)
 async def process_acs(message: types.Message, state: FSMContext):
@@ -504,7 +470,6 @@ async def process_acs(message: types.Message, state: FSMContext):
         await state.finish()
         await show_main_menu(message.from_user.id)
 
-
 @dp.callback_query_handler(lambda c: c.data == 'channels')
 async def process_channels(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
@@ -513,17 +478,13 @@ async def process_channels(callback_query: types.CallbackQuery):
     keyboard.add(InlineKeyboardButton("Добавить", callback_data='add_ch'))
     keyboard.add(InlineKeyboardButton("Удалить", callback_data='del_ch'))
     keyboard.add(InlineKeyboardButton("Закрыть", callback_data='close'))
-    await bot.send_photo(callback_query.from_user.id, photo=open('images/channels.jpg', 'rb'),
-                         caption=f"Каналы для парсинга:\n{channels_info}", reply_markup=keyboard, parse_mode='Markdown')
-
+    await bot.send_photo(callback_query.from_user.id, photo=open('images/channels.jpg', 'rb'), caption=f"Каналы для парсинга:\n{channels_info}", reply_markup=keyboard, parse_mode='Markdown')
 
 @dp.callback_query_handler(lambda c: c.data == 'add_ch')
 async def process_add_ch(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(callback_query.from_user.id, "Отправьте канал для добавления:",
-                           reply_markup=get_cancel_keyboard())
+    await bot.send_message(callback_query.from_user.id, "Отправьте канал для добавления:", reply_markup=get_cancel_keyboard())
     await Form.addch.set()
-
 
 @dp.callback_query_handler(lambda c: c.data == 'del_ch')
 async def process_dellch(callback_query: types.CallbackQuery):
@@ -533,7 +494,6 @@ async def process_dellch(callback_query: types.CallbackQuery):
         keyboard.add(InlineKeyboardButton(channel, callback_data=f'del_ch_{channel}'))
     keyboard.add(InlineKeyboardButton("Отмена", callback_data='cancel'))
     await bot.send_message(callback_query.from_user.id, "Выберите канал для удаления:", reply_markup=keyboard)
-
 
 @dp.callback_query_handler(lambda c: c.data.startswith('del_ch_'))
 async def process_delete_channel(callback_query: types.CallbackQuery):
@@ -547,14 +507,12 @@ async def process_delete_channel(callback_query: types.CallbackQuery):
         await bot.send_message(callback_query.from_user.id, f"Канал {channel} не найден в парсере")
     await show_main_menu(callback_query.from_user.id)
 
-
 @dp.callback_query_handler(lambda c: c.data == 'cancel', state='*')
 async def cancel_handler(callback_query: types.CallbackQuery, state: FSMContext):
     await state.finish()
     await bot.answer_callback_query(callback_query.id)
     await bot.send_message(callback_query.from_user.id, "Действие отменено.")
     await show_main_menu(callback_query.from_user.id)
-
 
 @dp.message_handler(state=Form.addch)
 async def process_addch(message: types.Message, state: FSMContext):
@@ -571,7 +529,6 @@ async def process_addch(message: types.Message, state: FSMContext):
             await message.reply(f"Ошибка: {e}. Пожалуйста, введите канал корректно.")
         await state.finish()
         await show_main_menu(message.from_user.id)
-
 
 @dp.message_handler(state=Form.dellch)
 async def process_dellch(message: types.Message, state: FSMContext):
@@ -593,7 +550,6 @@ async def process_dellch(message: types.Message, state: FSMContext):
         await state.finish()
         await show_main_menu(message.from_user.id)
 
-
 @dp.callback_query_handler(lambda c: c.data == 'chats')
 async def process_chats(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
@@ -602,23 +558,18 @@ async def process_chats(callback_query: types.CallbackQuery):
     keyboard.add(InlineKeyboardButton("Добавить", callback_data='add_chat'))
     keyboard.add(InlineKeyboardButton("Удалить", callback_data='del_chat'))
     keyboard.add(InlineKeyboardButton("Закрыть", callback_data='close'))
-    await bot.send_photo(callback_query.from_user.id, photo=open('images/chats.jpg', 'rb'),
-                         caption=f"Чаты для парсинга:\n{chats_info}", reply_markup=keyboard, parse_mode='Markdown')
-
+    await bot.send_photo(callback_query.from_user.id, photo=open('images/chats.jpg', 'rb'), caption=f"Чаты для парсинга:\n{chats_info}", reply_markup=keyboard, parse_mode='Markdown')
 
 @dp.callback_query_handler(lambda c: c.data == 'ok')
 async def process_ok(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     await bot.delete_message(callback_query.from_user.id, callback_query.message.message_id)
 
-
 @dp.callback_query_handler(lambda c: c.data == 'add_chat')
 async def process_add_chat(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(callback_query.from_user.id, "Отправьте chat_id для добавления:",
-                           reply_markup=get_cancel_keyboard())
+    await bot.send_message(callback_query.from_user.id, "Отправьте chat_id для добавления:",reply_markup=get_cancel_keyboard())
     await Form.addchat.set()
-
 
 @dp.callback_query_handler(lambda c: c.data == 'del_chat')
 async def process_dellchat(callback_query: types.CallbackQuery):
@@ -628,7 +579,6 @@ async def process_dellchat(callback_query: types.CallbackQuery):
         keyboard.add(InlineKeyboardButton(chat_id, callback_data=f'del_chat_{chat_id}'))
     keyboard.add(InlineKeyboardButton("Отмена", callback_data='cancel'))
     await bot.send_message(callback_query.from_user.id, "Выберите чат для удаления:", reply_markup=keyboard)
-
 
 @dp.callback_query_handler(lambda c: c.data.startswith('del_chat_'))
 async def process_delete_chat(callback_query: types.CallbackQuery):
@@ -641,7 +591,6 @@ async def process_delete_chat(callback_query: types.CallbackQuery):
     else:
         await bot.send_message(callback_query.from_user.id, f"Чат {chat_id} не найден в парсере")
     await show_main_menu(callback_query.from_user.id)
-
 
 @dp.message_handler(state=Form.addchat)
 async def process_addchat(message: types.Message, state: FSMContext):
@@ -658,7 +607,6 @@ async def process_addchat(message: types.Message, state: FSMContext):
             await message.reply(f"Ошибка: {e}. Пожалуйста, введите chat_id корректно.")
         await state.finish()
         await show_main_menu(message.from_user.id)
-
 
 @dp.message_handler(state=Form.dellchat)
 async def process_dellchat(message: types.Message, state: FSMContext):
@@ -680,43 +628,57 @@ async def process_dellchat(message: types.Message, state: FSMContext):
         await state.finish()
         await show_main_menu(message.from_user.id)
 
+parsed_users_count = 0  
+new_users_count = 0
 
 async def update_parsing_message(user_id, message_id, start_time):
+    global parsed_users_count, new_users_count
     while parsing_in_progress:
         elapsed_time = int(time.time() - start_time)
+        hours, remainder = divmod(elapsed_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        time_string = f"{hours} час {minutes:02d} мин {seconds:02d} сек"
+        
         await bot.edit_message_caption(
             chat_id=user_id,
             message_id=message_id,
-            caption=f"Парсинг начат..\nПрошло времени: {elapsed_time} секунд",
+            caption=(
+                f"Парсинг начат..\n"
+                f"Прошло времени: {time_string}\n"
+                f"Обработано пользователей: {parsed_users_count}\n"
+                f"Новые пользователи: {new_users_count}"
+            ),
             reply_markup=get_stop_parsing_keyboard()
         )
         await asyncio.sleep(1)
-
 
 @dp.callback_query_handler(lambda c: c.data == 'pars')
 async def process_pars(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     user_id = callback_query.from_user.id
-
-    # Формируем информацию о каналах и чатах
+    
     channels_info = "\n".join([f"Канал: [{channel}](https://t.me/{channel})" for channel in channels.keys()])
     chats_info = "\n".join([f"Чат: [{chat_id}](https://t.me/{chat_id})" for chat_id in chats.keys()])
-
-    # Создаем клавиатуру с двумя кнопками
+    
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("Подтвердить запуск", callback_data='confirm_pars'))
     keyboard.add(InlineKeyboardButton("Отмена", callback_data='cancel'))
 
-    # Отправляем сообщение с текстом и клавиатурой
-    await bot.send_message(user_id, f"Ссылки на каналы/чаты:\n\n{channels_info}\n{chats_info}\n\nПодтвердить запуск?",
-                           reply_markup=keyboard, parse_mode='Markdown')
+    #await bot.send_message(user_id, f"Ссылки на каналы/чаты:\n\n{channels_info}\n{chats_info}\n\nПодтвердить запуск?", reply_markup=keyboard, parse_mode='Markdown', disable_web_page_preview=True)
+    with open('images/links.jpg', 'rb') as photo:
+        await bot.send_photo(user_id, photo, caption=f"Ссылки на каналы/чаты:\n\n{channels_info}\n{chats_info}\n\nПодтвердить запуск?", reply_markup=keyboard, parse_mode='Markdown')
 
+@dp.callback_query_handler(lambda c: c.data == 'parsing_stats')
+async def show_parsing_stats(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    await bot.send_message(callback_query.from_user.id, f"Статистика парсинга:\nОбработано пользователей: {parsed_users_count}")
 
 def get_stop_parsing_keyboard():
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("Остановить парсинг", callback_data='stop_parsing'))
+    keyboard.add(InlineKeyboardButton("Статистика", callback_data='parsing_stats'))
     return keyboard
-
 
 @dp.callback_query_handler(lambda c: c.data == 'stop_parsing')
 async def stop_parsing_handler(callback_query: types.CallbackQuery):
@@ -728,33 +690,39 @@ async def stop_parsing_handler(callback_query: types.CallbackQuery):
     else:
         await bot.send_message(callback_query.from_user.id, "Парсинг не выполняется.")
 
-
 @dp.callback_query_handler(lambda c: c.data == 'confirm_pars')
 async def confirm_pars(callback_query: types.CallbackQuery):
-    global parsing_in_progress
+    global parsing_in_progress, parsed_users_count
     await bot.answer_callback_query(callback_query.id)
     user_id = callback_query.from_user.id
+    
+    if parsing_in_progress:
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("⛔️Остановить парсинг", callback_data='stop_parsing'))
+        keyboard.add(InlineKeyboardButton("❌Закрыть", callback_data='close'))
+        await bot.send_message(user_id, "Парсинг уже выполняется. Пожалуйста, дождитесь его завершения.", reply_markup=keyboard)
+        return
 
-    # Отправляем сообщение с фотографией stats.jpg
+    parsed_users_count = 0  # сброс с канавы
+    new_users_count = 0
+    parsing_in_progress = True
+    
     parsing_message = await bot.send_photo(
         user_id,
         photo=open('images/stats.jpg', 'rb'),
         caption="Парсинг начат",
         reply_markup=get_stop_parsing_keyboard()
     )
-
+    
     start_time = time.time()
 
-    parsing_in_progress = True
     asyncio.create_task(update_main_menu_text(user_id))
 
-    # Запускаем задачу обновления сообщения
     asyncio.create_task(update_parsing_message(user_id, parsing_message.message_id, start_time))
 
     global users, new_users, info_users
     users = load_users()
     new_users = set()
-    #info_users = {}
     await parse_channels(limit=50)
     for chat_id in chats:
         await parse_chat_members(chat_id)
@@ -763,7 +731,6 @@ async def confirm_pars(callback_query: types.CallbackQuery):
 
     parsing_in_progress = False
 
-    # Формируем сообщение для отправки
     summary_message = (
         f"<b>Всего пользователей:</b> {len(users)}\n"
         f"<b>Новые пользователи:</b> {len(new_users)}\n"
@@ -771,22 +738,11 @@ async def confirm_pars(callback_query: types.CallbackQuery):
     )
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("Получить файл", callback_data='convert'))
-    await bot.send_photo(user_id, photo=open('images/done.jpg', 'rb'), caption=summary_message, parse_mode='HTML',
-                         reply_markup=keyboard)
-
-    # Отправляем файлы, если они не пусты
-    #with open(full_base_file, 'rb') as f:
-    #     await bot.send_document(user_id, f)
-
-    # if os.path.getsize(new_users_file) > 0:
-    #     with open(new_users_file, 'rb') as f:
-    #         await bot.send_document(user_id, f)
-    # else:
-    #    await bot.send_message(user_id, "Файл new_users.json пуст.")
+    await bot.send_photo(user_id, photo=open('images/done.jpg', 'rb'), caption=summary_message, parse_mode='HTML', reply_markup=keyboard)
 
     await bot.delete_message(user_id, parsing_message.message_id)
-    #await show_main_menu(user_id)
 
+    new_users_count = 0
 
 @dp.callback_query_handler(lambda c: c.data == 'full_pars_ch')
 async def process_full_pars_ch(callback_query: types.CallbackQuery):
@@ -797,29 +753,38 @@ async def process_full_pars_ch(callback_query: types.CallbackQuery):
     keyboard.add(InlineKeyboardButton("Отмена", callback_data='cancel'))
     await bot.send_message(callback_query.from_user.id, "Выберите канал для полного парсинга:", reply_markup=keyboard)
 
-
 @dp.callback_query_handler(lambda c: c.data.startswith('full_pars_'))
 async def process_full_pars_channel(callback_query: types.CallbackQuery):
-    global parsing_in_progress
+    global parsing_in_progress, parsed_users_count
     await bot.answer_callback_query(callback_query.id)
+    user_id = callback_query.from_user.id
+
+    if parsing_in_progress:
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("⛔️Остановить парсинг", callback_data='stop_parsing'))
+        keyboard.add(InlineKeyboardButton("❌Закрыть", callback_data='close'))
+        await bot.send_message(user_id, "Парсинг уже выполняется. Пожалуйста, дождитесь его завершения.", reply_markup=keyboard)
+        return
+
+    parsed_users_count = 0
+
     channel = callback_query.data.split('_')[-1]
     user_id = callback_query.from_user.id
     await bot.send_message(user_id, f"Начало полного парсинга канала {channel}...")
-
-    # Отправляем сообщение с фотографией stats.jpg
+    
     parsing_message = await bot.send_photo(
         user_id,
         photo=open('images/stats.jpg', 'rb'),
         caption="Парсинг начат",
         reply_markup=get_stop_parsing_keyboard()
     )
-
+    
     start_time = time.time()
 
+    new_users_count = 0
     parsing_in_progress = True
     asyncio.create_task(update_main_menu_text(user_id))
 
-    # Запускаем задачу обновления сообщения
     asyncio.create_task(update_parsing_message(user_id, parsing_message.message_id, start_time))
 
     global users, new_users, info_users
@@ -832,7 +797,6 @@ async def process_full_pars_channel(callback_query: types.CallbackQuery):
 
     parsing_in_progress = False
 
-    # Формируем сообщение для отправки
     summary_message = (
         f"<b>Всего пользователей:</b> {len(users)}\n"
         f"<b>Новые пользователи:</b> {len(new_users)}\n"
@@ -840,22 +804,21 @@ async def process_full_pars_channel(callback_query: types.CallbackQuery):
     )
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("Конвертировать", callback_data='convert'))
-    await bot.send_photo(user_id, photo=open('images/done.jpg', 'rb'), caption=summary_message, parse_mode='HTML',
-                         reply_markup=keyboard)
+    await bot.send_photo(user_id, photo=open('images/done.jpg', 'rb'), caption=summary_message, parse_mode='HTML', reply_markup=keyboard)
 
     # Отправляем файлы, если они не пусты
     #with open(full_base_file, 'rb') as f:
     #    await bot.send_document(user_id, f)
-
-    #  if os.path.getsize(new_users_file) > 0:
-    #       with open(new_users_file, 'rb') as f:
-    #          await bot.send_document(user_id, f)
-    #    else:
-    #     await bot.send_message(user_id, "Файл new_users.json пуст.")
+    
+  #  if os.path.getsize(new_users_file) > 0:
+ #       with open(new_users_file, 'rb') as f:
+  #          await bot.send_document(user_id, f)
+#    else:
+   #     await bot.send_message(user_id, "Файл new_users.json пуст.")
 
     await bot.delete_message(user_id, parsing_message.message_id)
-    #await show_main_menu(user_id)
 
+    #await show_main_menu(user_id)
 
 @dp.callback_query_handler(lambda c: c.data == 'files')
 async def process_files(callback_query: types.CallbackQuery):
@@ -865,28 +828,23 @@ async def process_files(callback_query: types.CallbackQuery):
     keyboard.add(InlineKeyboardButton("Получить файлы", callback_data='get_files'))
     keyboard.add(InlineKeyboardButton("Удалить файлы", callback_data='dell_files'))
     keyboard.add(InlineKeyboardButton("Закрыть", callback_data='main_menu'))
-    await bot.send_photo(callback_query.from_user.id, photo=open('images/files.jpg', 'rb'), caption="Файлы:",
-                         reply_markup=keyboard)
-
+    await bot.send_photo(callback_query.from_user.id, photo=open('images/files.jpg', 'rb'), caption="Файлы:", reply_markup=keyboard)
 
 @dp.callback_query_handler(lambda c: c.data == 'get_files')
 async def process_get_files(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     user_id = callback_query.from_user.id
 
-    # Получение последних 10 файлов из папки newFILES
-    latest_files = get_latest_files('newFILES')
+    latest_files = [file_name for file_name in get_latest_files('newFILES') if file_name.endswith('.txt')]
     for file_name in latest_files:
         file_path = os.path.join('newFILES', file_name)
         with open(file_path, 'rb') as f:
             await bot.send_document(user_id, f)
 
-
 def get_latest_files(directory, num_files=10):
     files = os.listdir(directory)
     files.sort(key=lambda x: os.path.getmtime(os.path.join(directory, x)), reverse=True)
     return files[:num_files]
-
 
 @dp.callback_query_handler(lambda c: c.data == 'view_files')
 async def process_view_files(callback_query: types.CallbackQuery):
@@ -895,56 +853,121 @@ async def process_view_files(callback_query: types.CallbackQuery):
     file_list = "\n".join(files)
     await bot.send_message(callback_query.from_user.id, f"Файлы:\n{file_list}")
 
-
 @dp.callback_query_handler(lambda c: c.data == 'get_base')
 async def process_get_base(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     user_id = callback_query.from_user.id
 
-    # Отправка файла с общей базой
-    with open(full_base_file, 'rb') as f:
-        await bot.send_document(user_id, f)
+    txt_file = io.StringIO()
 
-    # Получение последних 10 файлов из папки newFILES
-    latest_files = get_latest_files('newFILES')
-    for file_name in latest_files:
-        file_path = os.path.join('newFILES', file_name)
-        with open(file_path, 'rb') as f:
-            await bot.send_document(user_id, f)
+    usernames = []
+    user_ids = []
+    phones = []
 
+    try:
+        if os.path.getsize(full_base_file) == 0:
+            logging.info("Файл new_users.json пуст.")
+            await bot.send_message(user_id, "Файл new_users.json пуст.")
+            return
+
+        with open(full_base_file, 'r') as f:
+            for line in f:
+                user_data = json.loads(line)
+                username = f"@{user_data.get('username', '')}" if user_data.get('username') else ''
+                user_id_value = user_data.get('user_id', '')
+                phone = user_data.get('phone', '')
+                if username:  # Пропускаем записи без логина
+                    usernames.append(username)
+                    user_ids.append(user_id_value)
+                    phones.append(phone)
+
+        # Записываем логины и номера телефонов в файл
+        for username, phone in zip(usernames, phones):
+            txt_file.write(f"{username}\t{phone}\n")
+
+        # Записываем идентификаторы в файл
+        for user_id_value in user_ids:
+            txt_file.write(f"{user_id_value}\n")
+
+        # Переводим указатель в начало файла
+        txt_file.seek(0)
+
+        # Отправляем текстовый файл пользователю
+        await bot.send_document(user_id, ('users.txt', txt_file.getvalue().encode('utf-8')), caption="База пользователей")
+
+    except FileNotFoundError:
+        logging.error("Файл new_users.json не найден.")
+        await bot.send_message(user_id, "Файл new_users.json не найден.")
+    finally:
+        # Закрываем файл
+        txt_file.close()
+
+   # latest_files = [file_name for file_name in get_latest_files('newFILES') if file_name.endswith('.txt')]
+    #for file_name in latest_files:
+    #    file_path = os.path.join('newFILES', file_name)
+    #    with open(file_path, 'rb') as f:
+    #        await bot.send_document(user_id, f)
 
 @dp.callback_query_handler(lambda c: c.data == 'dell_files')
 async def process_dell_files(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("⛔️ Удалить базу", callback_data='delete_base'))
+    keyboard.add(InlineKeyboardButton("⛔️ Удалить новые", callback_data='delete_new_files'))
+    keyboard.add(InlineKeyboardButton("❌ Закрыть", callback_data='close'))
+    await bot.send_photo(callback_query.from_user.id, photo=open('images/trash.jpg', 'rb'), caption="Выберите, что удалить:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == 'delete_base')
+async def delete_base(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
     try:
         os.remove(full_base_file)
-        os.remove(new_users_file)
-        # os.remove(channels_file)
-        #os.remove(chats_file)
-        await bot.send_message(callback_query.from_user.id, "JSON файлы удалены.")
+        await bot.send_message(callback_query.from_user.id, "База данных удалена.")
+        
+        # Перезагрузка пользователей
+        global users
+        users = load_users()
+        
+        # Обновление главного меню с новой статистикой
+        user_count = len(users)
+        last_parsed_count = len(new_users)
+        await bot.edit_message_caption(
+            chat_id=callback_query.from_user.id,
+            message_id=main_menu_message_id,
+            caption=f"Главное меню:\n\nВ базе: {user_count} чел\nСпарсено за последний раз: {last_parsed_count} чел",
+            reply_markup=None
+        )
     except Exception as e:
-        await bot.send_message(callback_query.from_user.id, f"Ошибка при удалении файлов: {e}")
-    await show_main_menu(callback_query.from_user.id)
+        await bot.send_message(callback_query.from_user.id, f"Ошибка при удалении базы данных: {e}")
+        await bot.delete_message(callback_query.from_user.id, callback_query.message.message_id)
 
+@dp.callback_query_handler(lambda c: c.data == 'delete_new_files')
+async def delete_new_files(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    try:
+        for file_name in os.listdir('newFILES'):
+            file_path = os.path.join('newFILES', file_name)
+            os.remove(file_path)
+        await bot.send_message(callback_query.from_user.id, "Все новые файлы удалены.")
+    except Exception as e:
+        await bot.send_message(callback_query.from_user.id, f"Ошибка при удалении новых файлов: {e}")
+    await bot.delete_message(callback_query.from_user.id, callback_query.message.message_id)
 
 @dp.callback_query_handler(lambda c: c.data == 'close')
 async def process_close(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     await bot.delete_message(callback_query.from_user.id, callback_query.message.message_id)
 
-
 @dp.callback_query_handler(lambda c: c.data == 'main_menu')
 async def process_main_menu(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     await show_main_menu(callback_query.from_user.id)
-
 
 @dp.errors_handler()
 async def errors_handler(update: types.Update, exception: Exception):
     logging.error(f"Update {update} caused error {exception}")
     for admin in acs_users:
         await bot.send_message(admin, f"Произошла ошибка: {exception}")
-
 
 @dp.callback_query_handler(lambda c: c.data == 'auto_parser')
 async def process_auto_parser(callback_query: types.CallbackQuery):
@@ -956,9 +979,7 @@ async def process_auto_parser(callback_query: types.CallbackQuery):
     keyboard.add(InlineKeyboardButton("Включить/Выключить", callback_data='toggle_auto_parser'))
     keyboard.add(InlineKeyboardButton("Настроить время", callback_data='set_auto_parser_time'))
     keyboard.add(InlineKeyboardButton("Закрыть", callback_data='close'))
-    await bot.send_photo(callback_query.from_user.id, photo=open('images/auto_parser.jpg', 'rb'),
-                         caption=f"Автономный парсер:\n\nСтатус: {status}\nВремя: {time}", reply_markup=keyboard)
-
+    await bot.send_photo(callback_query.from_user.id, photo=open('images/auto_parser.jpg', 'rb'), caption=f"Автономный парсер:\n\nСтатус: {status}\nВремя: {time}", reply_markup=keyboard)
 
 @dp.callback_query_handler(lambda c: c.data == 'toggle_auto_parser')
 async def toggle_auto_parser(callback_query: types.CallbackQuery):
@@ -971,14 +992,11 @@ async def toggle_auto_parser(callback_query: types.CallbackQuery):
     await bot.send_message(callback_query.from_user.id, f"Автономный парсер теперь {new_status}")
     await show_main_menu(callback_query.from_user.id)
 
-
 @dp.callback_query_handler(lambda c: c.data == 'set_auto_parser_time')
 async def set_auto_parser_time(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(callback_query.from_user.id, "Отправьте время в формате HH:MM:\n/cancel - отмена",
-                           reply_markup=get_cancel_keyboard())
+    await bot.send_message(callback_query.from_user.id, "Отправьте время в формате HH:MM:\n/cancel - отмена", reply_markup=get_cancel_keyboard())
     await Form.auto_parser_time.set()
-
 
 @dp.message_handler(state=Form.auto_parser_time)
 async def process_auto_parser_time(message: types.Message, state: FSMContext):
@@ -997,7 +1015,6 @@ async def process_auto_parser_time(message: types.Message, state: FSMContext):
         await state.finish()
         await show_main_menu(message.from_user.id)
 
-
 async def send_summary_message(user_id):
     summary_message = (
         f"<b>Всего пользователей:</b> {len(users)}\n"
@@ -1006,20 +1023,17 @@ async def send_summary_message(user_id):
     )
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("Конвертировать", callback_data='convert'))
-    await bot.send_photo(user_id, photo=open('images/done.jpg', 'rb'), caption=summary_message, parse_mode='HTML',
-                         reply_markup=keyboard)
-
+    await bot.send_photo(user_id, photo=open('images/done.jpg', 'rb'), caption=summary_message, parse_mode='HTML', reply_markup=keyboard)
 
 async def send_files(user_id):
     with open(full_base_file, 'rb') as f:
         await bot.send_document(user_id, f)
-
+    
     if os.path.getsize(new_users_file) > 0:
         with open(new_users_file, 'rb') as f:
             await bot.send_document(user_id, f)
     else:
         await bot.send_message(user_id, "Файл new_users.json пуст.")
-
 
 async def schedule_auto_parser():
     while True:
@@ -1039,7 +1053,6 @@ async def schedule_auto_parser():
             logging.info("Автономный парсер выключен. Ожидание...")
             await asyncio.sleep(60)
 
-
 async def run_auto_parser():
     global parsing_in_progress
     logging.info("Запуск автономного парсера...")
@@ -1054,17 +1067,15 @@ async def run_auto_parser():
     save_new_users(new_users)
     parsing_in_progress = False
     logging.info("Автономный парсер завершил работу.")
-
-    # Отправка summary сообщения и файлов после завершения парсинга
+    
+    # отправки щаоупы
     await send_summary_message(admin_id)
-    await send_files(admin_id)
-
+    await process_convert(admin_id)
 
 async def on_startup(dp):
     logging.info("Бот запущен")
     asyncio.create_task(schedule_auto_parser())
     asyncio.create_task(check_and_save_new_users_file())
-
 
 if __name__ == '__main__':
     # Настройка логирования
@@ -1079,5 +1090,5 @@ if __name__ == '__main__':
     users = load_users()
     acs_users = load_acs_users()
     auto_parser_settings = load_auto_parser_settings()
-
+    
     executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
